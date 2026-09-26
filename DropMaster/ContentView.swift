@@ -19,6 +19,8 @@ struct ContentView: View {
                     ForEach(SlotRole.allCases) { role in
                         DropZone(role: role, slot: model.slot(role),
                                  preset: role == .reference ? model.preset : nil,
+                                 profile: role == .reference ? model.profile : nil,
+                                 presetName: model.presetURL?.deletingPathExtension().lastPathComponent,
                                  slotNumber: role == .reference ? model.activeReference + 1 : nil,
                                  onDrop: { model.load($0, into: role) },
                                  onChoose: { model.choose(role) })
@@ -45,7 +47,7 @@ struct ContentView: View {
             HStack(alignment: .top, spacing: 14) {
                 LoudnessTable(rows: [
                     .init(name: "Target", present: model.target.audio != nil, stats: model.stats(.target)),
-                    .init(name: "Reference", present: model.reference.audio != nil || model.preset != nil,
+                    .init(name: "Reference", present: model.reference.audio != nil || model.preset != nil || model.profile != nil,
                           stats: model.referenceStats),
                     .init(name: "Matched", present: model.result != nil, stats: model.matchedStats, emphasised: true),
                 ], comparison: model.limiter.targetLUFS ?? model.referenceStats?.integrated)

@@ -13,7 +13,9 @@
 //
 //  The reference zone doubles as the preset's seat: with a preset loaded
 //  there is no reference file, and what the zone shows is the preset's
-//  name, the reference it was made from and that reference's loudness.
+//  name, the reference it was made from and that reference's loudness - or,
+//  for a slot opened from a preset set, the reference's name, the set's
+//  and the loudness.
 //  It shows the active one of the five reference slots, and says which in
 //  its title.
 //
@@ -25,6 +27,10 @@ struct DropZone: View {
     let slot: Slot
     /// Only the reference zone: a preset standing in for a file.
     var preset: MatchPreset? = nil
+    /// Only the reference zone: a profile from a set, without its file.
+    var profile: ReferenceProfile? = nil
+    /// The set it came from, for the subtitle.
+    var presetName: String? = nil
     /// Only the reference zone: which of the slots it shows, 1-based.
     var slotNumber: Int? = nil
     let onDrop: (URL) -> Void
@@ -39,7 +45,7 @@ struct DropZone: View {
             RoundedRectangle(cornerRadius: 12)
                 .strokeBorder(targeted ? Color.accentColor : Color.secondary.opacity(0.5),
                               style: StrokeStyle(lineWidth: targeted ? 2 : 1.2,
-                                                 dash: slot.url == nil && preset == nil ? [6, 4] : []))
+                                                 dash: slot.url == nil && preset == nil && profile == nil ? [6, 4] : []))
             content
                 .padding(14)
         }
@@ -63,7 +69,9 @@ struct DropZone: View {
                 .foregroundStyle(.secondary)
                 .tracking(1.2)
             if let preset {
-                presetContent(preset)
+                presetContent(preset.name, details: Self.presetDetails(preset))
+            } else if slot.url == nil, let profile {
+                presetContent(profile.name, details: Self.profileDetails(profile, presetName: presetName))
             } else {
                 fileContent
             }
@@ -71,14 +79,14 @@ struct DropZone: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func presetContent(_ preset: MatchPreset) -> some View {
+    private func presetContent(_ name: String, details: String) -> some View {
         Group {
             Image(systemName: "slider.horizontal.3")
                 .font(.system(size: 30, weight: .light))
                 .foregroundStyle(Color.accentColor)
-            Text(preset.name)
+            Text(name)
                 .font(.headline)
-            Text(Self.presetDetails(preset))
+            Text(details)
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
         }
@@ -132,11 +140,16 @@ struct DropZone: View {
             .truncationMode(.middle)
     }
 
-    /// A built-in preset has no reference name to show (see
-    /// MatchPreset.load) - it is meant to be judged by ear.
+    /// A preset without a reference name leaves it out.
     static func presetDetails(_ preset: MatchPreset) -> String {
         let loudness = preset.reference?.integrated.map { String(format: "%.1f LUFS", $0) } ?? "–"
         let source = preset.referenceName.isEmpty ? "" : "\(preset.referenceName) · "
+        return "Preset · \(source)\(loudness)"
+    }
+
+    static func profileDetails(_ profile: ReferenceProfile, presetName: String?) -> String {
+        let loudness = profile.stats.integrated.map { String(format: "%.1f LUFS", $0) } ?? "–"
+        let source = presetName.map { "\($0) · " } ?? ""
         return "Preset · \(source)\(loudness)"
     }
 

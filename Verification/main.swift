@@ -21,8 +21,11 @@
 //    should on their test signals, and the true peak finds the overshoot,
 //  - the limiter panel's settings do what they say, and the defaults give
 //    exactly what the match gave before the panel existed,
-//  - a preset carries the curve accurately enough at 1/12 octave, writes
-//    and reads back, and matches a new target through it.
+//  - a preset carries the curve accurately enough at 1/24 octave, writes
+//    and reads back, and matches a new target through it,
+//  - a reference profile gives the correction the two spectra gave before
+//    it existed, survives being sampled for a file, and a set of five
+//    slots writes and reads back - and damaged or future files are refused.
 //
 
 import Foundation
@@ -739,6 +742,167 @@ do {
     }
 } catch {
     check(false, "presets threw \(error)")
+}
+
+// MARK: - Reference profiles and sets
+
+/// The correction as it was computed before ReferenceProfile: the ratio of
+/// the two spectra first, then smoothed. Kept here only to prove the split
+/// into smoothed halves changes nothing.
+func correctionBeforeProfiles(target: [Double], reference: [Double], offsetDB: Double) -> [Double] {
+    let bins = target.count
+    let targetFloor = (target.max() ?? 0) * 1e-12 + 1e-30
+    let referenceFloor = (reference.max() ?? 0) * 1e-12 + 1e-30
+    var raw = [Double](repeating: 0, count: bins)
+    for k in 0..<bins {
+        raw[k] = 10 * log10((reference[k] + referenceFloor) / (target[k] + targetFloor)) - offsetDB
+    }
+    let width = MatchEQ.binHz
+    let firstBin = Int((MatchEQ.lowEdgeHz / width).rounded(.up))
+    let lastBin = min(bins - 1, Int((MatchEQ.highEdgeHz / width).rounded(.down)))
+    var smoothed = [Double](repeating: 0, count: bins)
+    for k in firstBin...lastBin {
+        let sigmaBins = max(1.5, 0.058 * Double(k) * width / width)
+        let reach = Int((3 * sigmaBins).rounded(.up))
+        var sum = 0.0, weights = 0.0
+        for j in max(1, k - reach)...min(bins - 1, k + reach) {
+            let d = Double(j - k) / sigmaBins
+            let w = exp(-0.5 * d * d)
+            sum += w * raw[j]
+            weights += w
+        }
+        smoothed[k] = sum / weights
+    }
+    for k in 0..<firstBin { smoothed[k] = smoothed[firstBin] }
+    for k in (lastBin + 1)..<bins { smoothed[k] = smoothed[lastBin] }
+    return smoothed.map { min(MatchEQ.clampDB, max(-MatchEQ.clampDB, $0)) }
+}
+
+/// Pink noise with narrow tonal peaks - the kind of detail that sampling a
+/// spectrum at 1/24 octave could smear, which smooth pink noise alone
+/// would never show.
+func tonalStereo(seconds: Double, seed: UInt64) -> StereoAudio {
+    let audio = pinkStereo(seconds: seconds, seed: seed, peak: 0.3)
+    for (hz, level) in [(58.0, 0.15), (528.0, 0.12), (3_150.0, 0.05), (9_800.0, 0.03)] {
+        let w = 2 * Double.pi * hz / StereoAudio.sampleRate
+        for i in 0..<audio.frameCount {
+            let v = Float(level * sin(w * Double(i)))
+            audio.left[i] += v
+            audio.right[i] += 0.8 * v
+        }
+    }
+    return audio
+}
+
+/// How far below `a` the difference `a - b` lies, in dB.
+func nullDepth(_ a: StereoAudio, _ b: StereoAudio) -> Double {
+    var signal = 0.0, residue = 0.0
+    for i in 0..<a.frameCount {
+        signal += Double(a.left[i] * a.left[i] + a.right[i] * a.right[i])
+        let dl = Double(a.left[i] - b.left[i]), dr = Double(a.right[i] - b.right[i])
+        residue += dl * dl + dr * dr
+    }
+    return 10 * log10(signal / max(residue, 1e-30))
+}
+
+print("Reference profiles and sets")
+do {
+    let reference = tonalStereo(seconds: 30, seed: 4)
+    let target = pinkStereo(seconds: 30, seed: 5)
+
+    // The split: smoothing each spectrum, then subtracting, is the
+    // smoothed ratio the matcher used before.
+    let (tm, ts) = MatchAnalysis.midSide(target)
+    let (rm, rs) = MatchAnalysis.midSide(reference)
+    let tp = MatchAnalysis.profile(tm, count: tm.count), rp = MatchAnalysis.profile(rm, count: rm.count)
+    var splitWorst = 0.0
+    for (t, r) in [(MatchAnalysis.powerSpectrum(tm, profile: tp), MatchAnalysis.powerSpectrum(rm, profile: rp)),
+                   (MatchAnalysis.powerSpectrum(ts, profile: tp), MatchAnalysis.powerSpectrum(rs, profile: rp))] {
+        let before = correctionBeforeProfiles(target: t, reference: r, offsetDB: 1.7)
+        let now = MatchEQ.correction(targetDB: MatchEQ.smoothedDB(t), referenceDB: MatchEQ.smoothedDB(r), offsetDB: 1.7)
+        splitWorst = max(splitWorst, zip(before, now).map { abs($0 - $1) }.max()!)
+    }
+    check(splitWorst < 1e-9, "smoothed halves = the smoothed ratio (max diff \(splitWorst) dB)")
+
+    let stats = LoudnessStats.measure(reference)
+    let profile = ReferenceProfile.measure(reference, name: "Tonal.wav", stats: stats)
+    let direct = try Matcher.prepare(target: target, reference: reference)
+    let viaProfile = try Matcher.prepare(target: target, profile: profile)
+    check(direct.midCurveDB == viaProfile.midCurveDB && direct.gainDB == viaProfile.gainDB
+          && direct.defaultTargetLUFS == Loudness.integrated(Loudness.hops(reference)),
+          "the audio path is the profile path, and aims at the reference's integrated LUFS")
+
+    // Sampled for a file: 1/24 octave at 0.01 dB.
+    let stored = profile.stored
+    let viaStored = try Matcher.prepare(target: target, profile: stored)
+    var curveWorst = 0.0, squares = 0.0, n = 0
+    for (a, b) in [(viaProfile.midCurveDB, viaStored.midCurveDB), (viaProfile.sideCurveDB, viaStored.sideCurveDB)] {
+        for k in Int(20 / MatchEQ.binHz)...Int(20_000 / MatchEQ.binHz) {
+            curveWorst = max(curveWorst, abs(a[k] - b[k])); squares += (a[k] - b[k]) * (a[k] - b[k]); n += 1
+        }
+    }
+    let curveRMS = sqrt(squares / Double(n))
+    let (fromProfile, _) = try Matcher.finish(viaProfile, settings: LimiterSettings())
+    let (fromStored, _) = try Matcher.finish(viaStored, settings: LimiterSettings())
+    let depth = nullDepth(fromProfile, fromStored)
+    check(curveWorst < 0.5 && curveRMS < 0.1,
+          "stored profile (1/24 octave, 0.01 dB): curve within \(String(format: "%.3f", curveWorst)) dB, rms \(String(format: "%.3f", curveRMS)) dB")
+    check(depth > 30, "stored vs. in-memory profile: the results null \(String(format: "%.1f", depth)) dB below the music")
+    check(stored.stored == stored, "a stored profile saved again is written unchanged")
+
+    // A set: two profiles, a version-1 curve, two empty slots.
+    let (_, curveReport) = try Matcher.finish(direct, settings: LimiterSettings())
+    let curve = MatchPreset(name: "Old Curve", referenceName: "Tonal.wav", report: curveReport, reference: stats,
+                            limiter: LimiterSettings(), autoCeilingDB: curveReport.ceilingDB)
+    var limiter = LimiterSettings(); limiter.targetLUFS = -14; limiter.autoRelease = false
+    let second = ReferenceProfile.measure(target, name: "Pink.wav", stats: LoudnessStats.measure(target)).stored
+    let set = PresetSet(name: "Five Slots", activeSlot: 2, limiter: limiter,
+                        slots: [PresetSlot(profile: stored), nil, PresetSlot(curve: curve), nil, PresetSlot(profile: second)])
+    let url = folder.appendingPathComponent("set.\(MatchPreset.fileExtension)")
+    try set.write(to: url)
+    let size = (try FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+    let back = try PresetFile.read(from: url)
+    check(back == .set(set), "a set of five slots writes and reads back unchanged (\(size) bytes on disk)")
+    check(size < 64 * 1024, "a set file stays small (\(size / 1024) kB for two profiles and a curve)")
+    let text = try String(contentsOf: url, encoding: .utf8)
+    check(!text.contains("0000000"), "no float noise in the file (0.30000000000000004)")
+
+    // A version-1 file still opens as a curve, through the same reader.
+    let curveURL = folder.appendingPathComponent("curve.\(MatchPreset.fileExtension)")
+    try curve.write(to: curveURL)
+    check(try PresetFile.read(from: curveURL) == .curve(curve), "a version-1 preset still opens as a single curve")
+
+    // Refused: a future version, a slot with both or neither, cut spectra.
+    func refused(_ json: [String: Any], _ what: String, tooNew: Bool = false) throws {
+        let bad = folder.appendingPathComponent("bad.\(MatchPreset.fileExtension)")
+        try JSONSerialization.data(withJSONObject: json).write(to: bad)
+        do {
+            _ = try PresetFile.read(from: bad)
+            check(false, "\(what) is refused")
+        } catch PresetError.tooNew {
+            check(tooNew, "\(what) is refused (too new)")
+        } catch {
+            check(!tooNew, "\(what) is refused (\(error.localizedDescription))")
+        }
+    }
+    let json = try JSONSerialization.jsonObject(with: try Data(contentsOf: url)) as! [String: Any]
+    var future = json; future["version"] = 3
+    try refused(future, "a set from a newer DropMaster", tooNew: true)
+    var slots = json["slots"] as! [Any]
+    var both = slots[0] as! [String: Any]
+    both["curve"] = (slots[2] as! [String: Any])["curve"]
+    var doubled = json; slots[0] = both; doubled["slots"] = slots
+    try refused(doubled, "a slot holding a profile and a curve")
+    var cut = (json["slots"] as! [Any])[4] as! [String: Any]
+    var cutProfile = cut["profile"] as! [String: Any]
+    cutProfile["mid"] = Array((cutProfile["mid"] as! [Any]).dropLast())
+    cut["profile"] = cutProfile
+    var truncated = json; var cutSlots = json["slots"] as! [Any]; cutSlots[4] = cut; truncated["slots"] = cutSlots
+    try refused(truncated, "a set with a cut spectrum")
+    var empty = json; empty["slots"] = [NSNull(), NSNull(), NSNull(), NSNull(), NSNull()]
+    try refused(empty, "a set with no slot filled")
+} catch {
+    check(false, "reference profiles threw \(error)")
 }
 
 print(failures == 0 ? "\nALL PASSED" : "\n\(failures) FAILURE(S)")

@@ -2,16 +2,25 @@
 //  MatchPreset.swift
 //  DropMaster
 //
-//  A match, saved: the tone correction of a reference, its loudness, and
-//  the limiter settings that went with it - so the same reference can be
-//  applied to the next song without loading it again. The user saves
-//  these; nothing ships with the app. Ten anonymous presets did for half
-//  an hour on 2026-09-20 and came straight back out: a canned reference
-//  nobody can place is more irritating than helpful, and picking one's own
-//  record is the whole idea. One file per preset,
-//  JSON, about 4.8 kB as written - pretty-printed, because a preset one
-//  can read and edit in a text editor is worth more than the kilobyte it
-//  costs.
+//  Two kinds of file share the extension `.dmpreset`, told apart by their
+//  `version`:
+//
+//  - Version 1, `MatchPreset`: one match, saved - the tone correction of a
+//    reference against the target of the day, its loudness, and the
+//    limiter settings. Written until 2026-09-26; still opened, into the
+//    active slot, and kept inside sets as it is.
+//  - Version 2, `PresetSet`: all five reference slots, each as a
+//    ReferenceProfile (see there) - what the reference *is*, not what it
+//    did to one target - plus the active slot and the limiter settings. It
+//    needs no target to be saved, and matches the next target the way the
+//    references themselves would.
+//
+//  The user saves these; nothing ships with the app. Ten anonymous presets
+//  did for half an hour on 2026-09-20 and came straight back out: a canned
+//  reference nobody can place is more irritating than helpful, and picking
+//  one's own record is the whole idea. JSON, pretty-printed, because a
+//  preset one can read and edit in a text editor is worth more than the
+//  kilobytes it costs.
 //
 //  The curve is stored 24 points per octave from 20 Hz to 20 kHz - 240
 //  numbers per channel instead of the 2049 bins it is computed on, for a
@@ -41,7 +50,7 @@ nonisolated struct MatchPreset: Codable, Sendable, Equatable {
     static let pointsPerOctave = 24.0
     static let lowHz = 20.0
     static let highHz = 20_000.0
-    /// Written into every file, read back to refuse a future format.
+    /// The version of a single-curve file. Sets are PresetSet.version.
     static let currentVersion = 1
 
     var version = MatchPreset.currentVersion
@@ -92,13 +101,17 @@ nonisolated struct MatchPreset: Codable, Sendable, Equatable {
 
     /// The curve at the stored frequencies, rounded to 0.1 dB - finer than
     /// anyone can hear on a broad curve, and it keeps the file readable.
-    static func sample(_ curve: [Double], perOctave: Double = pointsPerOctave) -> [Double] {
-        frequencies(perOctave: perOctave).map { hz in
+    /// A ReferenceProfile's spectra use 0.01 (see there).
+    static func sample(_ curve: [Double], perOctave: Double = pointsPerOctave, step: Double = 0.1) -> [Double] {
+        // × 10 then ÷ 10, not ÷ 0.1 then × 0.1: the latter writes
+        // 0.30000000000000004 into the file.
+        let scale = (1 / step).rounded()
+        return frequencies(perOctave: perOctave).map { hz in
             let x = hz / MatchEQ.binHz
             let i = min(curve.count - 2, max(0, Int(x)))
             let fraction = min(1, max(0, x - Double(i)))
             let value = curve[i] * (1 - fraction) + curve[i + 1] * fraction
-            return (value * 10).rounded() / 10
+            return (value * scale).rounded() / scale
         }
     }
 
@@ -135,15 +148,83 @@ nonisolated struct MatchPreset: Codable, Sendable, Equatable {
     }
 
     static func read(from url: URL) throws -> MatchPreset {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        let preset = try decoder.decode(MatchPreset.self, from: Data(contentsOf: url))
-        guard preset.version <= currentVersion else { throw PresetError.tooNew(url.lastPathComponent) }
-        let expected = frequencies(perOctave: preset.resolution).count
-        guard preset.mid.count == expected, preset.side.count == expected else {
+        guard case .curve(let preset) = try PresetFile.read(from: url) else {
             throw PresetError.damaged(url.lastPathComponent)
         }
         return preset
+    }
+
+    /// Whether the curves have as many points as their resolution needs.
+    var isComplete: Bool {
+        let expected = Self.frequencies(perOctave: resolution).count
+        return mid.count == expected && side.count == expected
+    }
+}
+
+/// One slot of a set: a measured reference, or a version-1 curve that was
+/// open in that slot. Never both.
+nonisolated struct PresetSlot: Codable, Sendable, Equatable {
+    var profile: ReferenceProfile?
+    var curve: MatchPreset?
+
+    var name: String { profile?.name ?? curve?.name ?? "" }
+}
+
+/// All five reference slots, saved: version 2 of the file.
+nonisolated struct PresetSet: Codable, Sendable, Equatable {
+    static let currentVersion = 2
+
+    var version = PresetSet.currentVersion
+    var name: String
+    /// Whole seconds, as in MatchPreset.
+    var created = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded())
+    /// 0-based; the slot the set was saved with active.
+    var activeSlot: Int
+    var limiter: LimiterSettings
+    /// One entry per slot, null where the slot was empty.
+    var slots: [PresetSlot?]
+
+    func write(to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(self).write(to: url)
+    }
+}
+
+/// What a `.dmpreset` turned out to hold.
+nonisolated enum PresetFile: Sendable, Equatable {
+    case curve(MatchPreset)
+    case set(PresetSet)
+
+    private struct Header: Decodable { var version: Int? }
+
+    static func read(from url: URL) throws -> PresetFile {
+        let name = url.lastPathComponent
+        let data = try Data(contentsOf: url)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let header = try? decoder.decode(Header.self, from: data) else { throw PresetError.damaged(name) }
+        let version = header.version ?? 1
+        guard version <= PresetSet.currentVersion else { throw PresetError.tooNew(name) }
+        do {
+            if version <= MatchPreset.currentVersion {
+                let preset = try decoder.decode(MatchPreset.self, from: data)
+                guard preset.isComplete else { throw PresetError.damaged(name) }
+                return .curve(preset)
+            }
+            let set = try decoder.decode(PresetSet.self, from: data)
+            let entries = set.slots.compactMap { $0 }
+            guard !entries.isEmpty,
+                  entries.allSatisfy({ ($0.profile?.isComplete ?? true) && ($0.curve?.isComplete ?? true)
+                                       && ($0.profile == nil) != ($0.curve == nil) })
+            else { throw PresetError.damaged(name) }
+            return .set(set)
+        } catch let error as PresetError {
+            throw error
+        } catch {
+            throw PresetError.damaged(name)
+        }
     }
 }
 

@@ -45,9 +45,9 @@ struct DropMasterApp: App {
                     .keyboardShortcut("p")
                 Button("Save Preset…") { model.savePreset() }
                     .keyboardShortcut("s")
-                    .disabled(!model.canExport)
+                    .disabled(!model.canSavePreset)
                 Button("Close Preset") { model.closePreset() }
-                    .disabled(model.preset == nil)
+                    .disabled(!model.canClosePreset)
             }
             CommandGroup(replacing: .saveItem) {
                 Button("Export \(model.exportFormat.menuTitle) · \(model.exportQuality.label)…") { model.export() }
@@ -78,7 +78,7 @@ struct DropMasterApp: App {
                         .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: [.command, .option])
                 }
                 Button("Clear Reference Slot") { model.clearReference(model.activeReference) }
-                    .disabled(model.reference.url == nil && model.preset == nil)
+                    .disabled(!model.hasReference)
             }
         }
     }

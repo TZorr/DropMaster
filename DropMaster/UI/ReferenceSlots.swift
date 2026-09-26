@@ -12,7 +12,7 @@
 //  the slot.
 //
 //  What a button looks like says what its slot holds - accent for the
-//  active one, a light fill for a loaded file or preset, an outline for an
+//  active one, a light fill for a loaded file, profile or preset, an outline for an
 //  empty slot - so the row reads at a glance which numbers are worth
 //  pressing. The name is in the tooltip.
 //
@@ -28,6 +28,7 @@ struct ReferenceSlots: View {
                 SlotButton(number: index + 1,
                            slot: model.references[index],
                            preset: model.presets[index],
+                           profile: model.profiles[index],
                            active: index == model.activeReference,
                            onSelect: { model.selectReference(index) },
                            onDrop: { model.loadReference($0, slot: index) },
@@ -42,6 +43,7 @@ private struct SlotButton: View {
     let number: Int
     let slot: Slot
     let preset: MatchPreset?
+    let profile: ReferenceProfile?
     let active: Bool
     let onSelect: () -> Void
     let onDrop: (URL) -> Void
@@ -50,10 +52,10 @@ private struct SlotButton: View {
 
     @State private var targeted = false
 
-    private var filled: Bool { preset != nil || slot.url != nil }
+    private var filled: Bool { preset != nil || profile != nil || slot.url != nil }
 
     private var name: String? {
-        preset?.name ?? slot.url?.lastPathComponent
+        preset?.name ?? slot.url?.lastPathComponent ?? profile?.name
     }
 
     private var failed: Bool {

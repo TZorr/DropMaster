@@ -114,21 +114,32 @@ Target and reference may each be 3 seconds to 20 minutes long.
 
 ## Presets
 
-**File › Save Preset…** (⌘S) keeps the current match: the tone correction,
-the reference's loudness figures, the ceiling it asked for and the limiter
-settings. **Open Preset…** (⌘P) puts it back into the active reference
-slot, where it stands in for the reference, so a whole album can be
-matched to one record without loading that record again. Its limiter
-settings are applied when it is opened, not every time its slot is chosen.
-**Close Preset** empties that slot again; dropping a reference into it
-replaces the preset.
+**File › Save Preset…** (⌘S) saves all five reference slots in one file,
+with or without a target loaded: for each slot what the match needs from
+its reference - the smoothed Mid and Side spectra of its loud passages,
+their level, its peak and its loudness figures - plus which slot was
+active and the limiter settings. **Open Preset…** (⌘P) puts all five back.
+They then stand in for the references, so a whole album can be matched
+against the same five records without loading them again. The result is
+the one the files themselves give: the match always runs on this
+measurement, whether it was just taken from a file or read from a preset.
+The references' audio is not in the file, so **Reference** preview (⌘3)
+needs the file dropped in again.
 
-The curve is stored 24 points per octave from 20 Hz to 20 kHz, 240 numbers
-per channel rather than the 2049 FFT bins it is computed on. Rebuilding the
-bins from those points is within 0.36 dB at the tip of the sharpest peak a
-real match produced, and 0.045 dB rms. A preset is readable JSON of about
-4.7 kB, extension `.dmpreset`; presets written at the earlier 1/12 octave
-still load, because the resolution is in the file.
+Both dialogs open in the folder of the active reference, where its presets
+belong - or, without a file loaded, where the last preset was opened or
+saved. Limiter settings are applied when a preset is opened, not every
+time a slot is chosen. **Close Preset** empties the active slot; dropping a
+reference into a slot replaces what the preset put there.
+
+The spectra are stored 24 points per octave from 20 Hz to 20 kHz, to
+0.01 dB. In the harness a match through the stored form nulls 45 dB below
+the music against the in-memory measurement. A preset of five slots is
+readable JSON of about 40 kB, extension `.dmpreset`.
+
+Presets from DropMaster 1.1 and earlier hold one correction curve, measured
+against the target of that day. They still open, into the active slot,
+and a set saved afterwards keeps them as they are.
 
 Loudness is still measured per song: a preset aims at the LUFS its
 reference had, or at the target set in the limiter panel.
@@ -171,7 +182,9 @@ smoothing, filter design, limiter). Matchering is GPLv3; DropMaster is MIT.
   self-match, tone and level matching on pink noise, the ceiling, WAV
   round trips of every export format and quality, the decoder, the A/B
   player, LUFS / LRA / true peak on the EBU test signals, the limiter
-  settings, and presets (curve accuracy, round trip, matching through one).
+  settings, and presets (curve accuracy, round trip, matching through one;
+  reference profiles against the old curve maths, sets of five slots,
+  damaged and future files refused).
 - `swift Tools/make_icon.swift` - redraws the app icon.
 
 ## Licence

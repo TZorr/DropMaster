@@ -13,12 +13,26 @@
 //  between references as fast as between Original and Matched. Nothing is
 //  remembered across launches, as with the target.
 //
-//  A preset stands in for a reference: when one is loaded, the tone comes
-//  from its saved curve and its slot shows the preset instead. Dropping a
-//  reference into that slot throws the preset away - two sources for the
-//  same curve would be one too many. The preset's limiter settings are
-//  applied when it is opened, not every time its slot is chosen: a slot
+//  A match runs on the reference's ReferenceProfile, not its audio: once a
+//  reference has decoded, its profile is measured beside its loudness
+//  figures, and the match starts when both are there. The audio stays for
+//  listening. So a slot can hold a reference without audio - a profile
+//  opened from a preset set - and match exactly as the file would.
+//
+//  Presets (MatchPreset.swift) are saved as a set: all five slots'
+//  profiles, the active slot and the limiter settings - with or without a
+//  target, which a profile does not involve. Opening a set replaces all
+//  five slots. An old single-curve preset opens into the active slot and
+//  stands in for its reference; a set keeps it as it is. Dropping a
+//  reference into a slot throws its preset or profile away - two sources
+//  for the same slot would be one too many. A preset's limiter settings
+//  are applied when it is opened, not every time a slot is chosen: a slot
 //  button that silently rewrote the limiter panel would be a trap.
+//
+//  The file dialogs for presets start in the active reference's folder -
+//  where the references live is where their presets belong - or, without
+//  a file there, the first slot's that has one, then the folder of the
+//  last preset opened or saved.
 //
 //  There is no "Match" button. The moment the target and the active slot
 //  hold decoded audio the match starts, and dropping a new file into
@@ -104,8 +118,15 @@ final class AppModel {
     private(set) var target = Slot()
     /// The reference slots; `activeReference` is the one matched against.
     private(set) var references = Array(repeating: Slot(), count: AppModel.referenceSlotCount)
-    /// Saved matches standing in for a slot's reference, per slot.
+    /// Old single-curve presets standing in for a slot's reference, per
+    /// slot.
     private(set) var presets: [MatchPreset?] = Array(repeating: nil, count: AppModel.referenceSlotCount)
+    /// What each slot's reference is, as far as matching goes: measured
+    /// from its file, or opened from a set without one.
+    private(set) var profiles: [ReferenceProfile?] = Array(repeating: nil, count: AppModel.referenceSlotCount)
+    /// The preset file last opened or saved, for the dialogs' folder and
+    /// name, and the drop zone's subtitle. This session only.
+    private(set) var presetURL: URL?
     private(set) var activeReference = 0
     private(set) var match: MatchState = .idle
     private(set) var result: StereoAudio?
@@ -122,6 +143,7 @@ final class AppModel {
     /// it, or nil.
     var reference: Slot { references[activeReference] }
     var preset: MatchPreset? { presets[activeReference] }
+    var profile: ReferenceProfile? { profiles[activeReference] }
 
     var limiter: LimiterSettings = AppModel.storedLimiter() {
         didSet {
@@ -170,10 +192,16 @@ final class AppModel {
 
     /// What the loudness table's Reference row shows: the loaded
     /// reference, or the figures the preset carries.
-    var referenceStats: LoudnessStats? { preset?.reference ?? stats(.reference) }
+    var referenceStats: LoudnessStats? { preset?.reference ?? profile?.stats ?? stats(.reference) }
 
-    /// Matching needs a target plus either a reference or a preset.
-    var canMatch: Bool { target.audio != nil && (preset != nil || reference.audio != nil) }
+    /// Matching needs a target plus a reference - a file, a profile or a
+    /// curve. A decoded file counts before its profile is measured.
+    var canMatch: Bool {
+        target.audio != nil && (preset != nil || profile != nil || reference.audio != nil)
+    }
+
+    /// Whether the active slot holds a reference of any kind.
+    var hasReference: Bool { reference.url != nil || preset != nil || profile != nil }
 
     func load(_ url: URL, into role: SlotRole) {
         load(url, key: key(role))
@@ -198,9 +226,10 @@ final class AppModel {
             player.setOriginal(nil)
             exportMessage = nil
         case .reference(let index):
-            // A dropped reference replaces the slot's preset: it is the
-            // fresher answer to the same question.
+            // A dropped reference replaces the slot's preset or profile:
+            // it is the fresher answer to the same question.
             presets[index] = nil
+            profiles[index] = nil
             if index == activeReference {
                 cancelMatch()
                 player.setReference(nil)
@@ -222,6 +251,10 @@ final class AppModel {
             if case .ready(let audio, _) = state {
                 let measured = LoudnessStats.measure(audio)
                 await self?.measured(key, generation: mine, stats: measured)
+                if case .reference(let index) = key, !Task.isCancelled {
+                    let profile = ReferenceProfile.measure(audio, name: url.lastPathComponent, stats: measured)
+                    await self?.profiled(index, generation: mine, profile: profile)
+                }
             }
         }
     }
@@ -238,12 +271,19 @@ final class AppModel {
         case .target:
             player.setOriginal(target.audio)
         case .reference(let index):
-            // A slot in the background only fills; it is matched against
-            // when it is chosen.
-            guard index == activeReference else { return }
-            player.setReference(reference.audio)
+            // Matching waits for the profile (`profiled`).
+            if index == activeReference { player.setReference(reference.audio) }
+            return
         }
         startMatchIfReady()
+    }
+
+    private func profiled(_ index: Int, generation: Int, profile: ReferenceProfile) {
+        guard decodeGeneration[.reference(index)] == generation else { return }
+        profiles[index] = profile
+        // A slot in the background only fills; it is matched against
+        // when it is chosen.
+        if index == activeReference { startMatchIfReady() }
     }
 
     /// Makes another slot the active reference and matches against it. An
@@ -259,12 +299,7 @@ final class AppModel {
     /// Empties a slot: its file, its preset and its figures.
     func clearReference(_ index: Int) {
         guard references.indices.contains(index) else { return }
-        let key = SlotKey.reference(index)
-        decodeTasks[key]?.cancel()
-        decodeGeneration[key] = (decodeGeneration[key] ?? 0) + 1
-        references[index] = Slot()
-        presets[index] = nil
-        slotStats[key] = nil
+        emptySlot(index)
         if index == activeReference {
             player.setReference(nil)
             cancelMatch()
@@ -315,9 +350,9 @@ final class AppModel {
     }
 
     private func startMatchIfReady() {
-        guard let targetAudio = target.audio, preset != nil || reference.audio != nil else { return }
-        let referenceAudio = reference.audio
-        let usedPreset = preset
+        guard let targetAudio = target.audio else { return }
+        let usedPreset = preset, usedProfile = profile, referenceAudio = reference.audio
+        guard usedPreset != nil || usedProfile != nil else { return }
         matchGeneration += 1
         let mine = matchGeneration
         match = .running(.analysing)
@@ -329,11 +364,15 @@ final class AppModel {
                 let progress: (MatchStage) -> Void = { [weak self] stage in
                     Task { await self?.progressed(stage, generation: mine) }
                 }
+                // The profile cannot tell; the audio still can.
+                if usedPreset == nil, let referenceAudio, targetAudio.isIdentical(to: referenceAudio) {
+                    throw MatchError.identical
+                }
                 let preparation: MatchPreparation
                 if let usedPreset {
                     preparation = try Matcher.prepare(target: targetAudio, preset: usedPreset, progress: progress)
                 } else {
-                    preparation = try Matcher.prepare(target: targetAudio, reference: referenceAudio!, progress: progress)
+                    preparation = try Matcher.prepare(target: targetAudio, profile: usedProfile!, progress: progress)
                 }
                 progress(.limiting)
                 let (audio, report) = try Matcher.finish(preparation, settings: settings)
@@ -408,19 +447,52 @@ final class AppModel {
 
     // MARK: - Presets
 
-    /// A preset read from a file, into the active slot.
+    /// Whether there is anything to save: a slot with a profile or a
+    /// curve. No target needed.
+    var canSavePreset: Bool {
+        profiles.contains { $0 != nil } || presets.contains { $0 != nil }
+    }
+
+    /// Whether the active slot holds a preset's reference - a curve, or a
+    /// profile without its file - that Close Preset would empty.
+    var canClosePreset: Bool { preset != nil || (profile != nil && reference.url == nil) }
+
+    /// An old single-curve preset, into the active slot.
     func apply(_ loaded: MatchPreset) {
-        let index = activeReference, key = SlotKey.reference(activeReference)
+        let index = activeReference
+        emptySlot(index)
         presets[index] = loaded
         limiter = loaded.limiter
-        // The preset answers for the slot's reference; the slot shows it.
-        decodeTasks[key]?.cancel()
-        decodeGeneration[key] = (decodeGeneration[key] ?? 0) + 1
-        references[index] = Slot()
-        slotStats[key] = nil
         player.setReference(nil)
         cancelMatch()
         startMatchIfReady()
+    }
+
+    /// A set, into all five slots: whatever they held goes.
+    func apply(_ set: PresetSet) {
+        for index in references.indices {
+            emptySlot(index)
+            let entry = index < set.slots.count ? set.slots[index] : nil
+            presets[index] = entry?.curve
+            profiles[index] = entry?.profile
+        }
+        activeReference = min(max(set.activeSlot, 0), references.count - 1)
+        limiter = set.limiter
+        player.setReference(nil)
+        cancelMatch()
+        startMatchIfReady()
+    }
+
+    /// A slot's file, audio, figures and preset, gone - and any decode
+    /// still running for it made stale.
+    private func emptySlot(_ index: Int) {
+        let key = SlotKey.reference(index)
+        decodeTasks[key]?.cancel()
+        decodeGeneration[key] = (decodeGeneration[key] ?? 0) + 1
+        references[index] = Slot()
+        presets[index] = nil
+        profiles[index] = nil
+        slotStats[key] = nil
     }
 
     func openPreset() {
@@ -428,43 +500,70 @@ final class AppModel {
         panel.title = "Open a preset"
         panel.allowedContentTypes = [UTType(filenameExtension: MatchPreset.fileExtension) ?? .json]
         panel.allowsMultipleSelection = false
+        panel.directoryURL = presetFolder
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
-            apply(try MatchPreset.read(from: url))
+            try openPreset(at: url)
         } catch {
             match = .failed(error.localizedDescription)
         }
     }
 
-    /// The current match, saved: its curve, the reference's loudness and
-    /// the limiter settings (see MatchPreset).
+    func openPreset(at url: URL) throws {
+        switch try PresetFile.read(from: url) {
+        case .curve(let loaded): apply(loaded)
+        case .set(let loaded): apply(loaded)
+        }
+        presetURL = url
+    }
+
+    /// All five slots, saved: each one's profile (or old curve), the
+    /// active slot and the limiter settings (see MatchPreset.swift).
     func savePreset() {
-        guard case .done(let report) = match, let preparation else { return }
+        guard canSavePreset else { return }
         let panel = NSSavePanel()
         panel.title = "Save preset"
         panel.allowedContentTypes = [UTType(filenameExtension: MatchPreset.fileExtension) ?? .json]
-        let base = preset?.name ?? reference.url?.deletingPathExtension().lastPathComponent ?? "Preset"
+        let base = presetURL?.deletingPathExtension().lastPathComponent
+            ?? reference.url?.deletingPathExtension().lastPathComponent
+            ?? "Preset"
         panel.nameFieldStringValue = "\(base).\(MatchPreset.fileExtension)"
+        panel.directoryURL = presetFolder
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let saved = MatchPreset(name: url.deletingPathExtension().lastPathComponent,
-                                referenceName: reference.url?.lastPathComponent ?? preset?.referenceName ?? "",
-                                report: report, reference: referenceStats, limiter: limiter,
-                                autoCeilingDB: preparation.autoCeilingDB)
         do {
-            try saved.write(to: url)
-            exportMessage = "Saved \(url.lastPathComponent)"
-            if preset != nil { presets[activeReference] = saved }
+            let filled = try savePreset(to: url)
+            exportMessage = "Saved \(url.lastPathComponent) · \(filled) of \(references.count) slots"
         } catch {
             exportMessage = error.localizedDescription
         }
     }
 
+    /// Writes the set; returns how many slots it holds.
+    @discardableResult
+    func savePreset(to url: URL) throws -> Int {
+        let slots = references.indices.map { index -> PresetSlot? in
+            if let profile = profiles[index] { return PresetSlot(profile: profile.stored) }
+            if let curve = presets[index] { return PresetSlot(curve: curve) }
+            return nil
+        }
+        let set = PresetSet(name: url.deletingPathExtension().lastPathComponent,
+                            activeSlot: activeReference, limiter: limiter, slots: slots)
+        try set.write(to: url)
+        presetURL = url
+        return slots.compactMap { $0 }.count
+    }
+
+    /// Where the preset dialogs open: beside the references.
+    var presetFolder: URL? {
+        let files = [reference.url] + references.map(\.url)
+        return files.compactMap { $0 }.first?.deletingLastPathComponent()
+            ?? presetURL?.deletingLastPathComponent()
+    }
+
     func closePreset() {
-        guard preset != nil else { return }
-        presets[activeReference] = nil
-        cancelMatch()
-        startMatchIfReady()
+        guard canClosePreset else { return }
+        clearReference(activeReference)
     }
 
     // MARK: - Export

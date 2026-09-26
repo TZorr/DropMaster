@@ -116,35 +116,44 @@ nonisolated enum Matcher {
     /// Stages 1 to 4: everything up to the limiter. The slow part, done once
     /// per pair of files; its result is kept so the limiter can be run again
     /// with other settings in a fraction of the time.
+    ///
+    /// The reference is measured into a ReferenceProfile first, and the
+    /// match runs on that - the same path as a profile read from a preset.
     static func prepare(target: StereoAudio, reference: StereoAudio, allowIdentical: Bool = false,
                         progress: (MatchStage) -> Void = { _ in }) throws -> MatchPreparation {
         try validate(target, role: "target")
         try validate(reference, role: "reference")
         if !allowIdentical && target.isIdentical(to: reference) { throw MatchError.identical }
+        progress(.analysing)
+        let profile = ReferenceProfile.measure(reference, name: "", stats: LoudnessStats.measure(reference))
+        try Task.checkCancellation()
+        return try prepare(target: target, profile: profile, progress: progress)
+    }
+
+    /// Stages 1 to 4 against a measured reference.
+    static func prepare(target: StereoAudio, profile: ReferenceProfile,
+                        progress: (MatchStage) -> Void = { _ in }) throws -> MatchPreparation {
+        try validate(target, role: "target")
+        guard profile.isComplete else { throw PresetError.damaged(profile.name) }
 
         // 1-2. Mid/Side and loudness.
         progress(.analysing)
         let (targetMid, targetSide) = MatchAnalysis.midSide(target)
-        var referenceMS: (mid: [Float], side: [Float])? = MatchAnalysis.midSide(reference)
         let targetProfile = MatchAnalysis.profile(targetMid, count: targetMid.count)
-        let referenceProfile = MatchAnalysis.profile(referenceMS!.mid, count: referenceMS!.mid.count)
-        let referenceRMS = referenceProfile.loudRMS
+        let referenceRMS = profile.loudRMS
         let firstGain = referenceRMS / max(targetProfile.loudRMS, 1e-9)
-        let ceiling = min(Double(reference.peak), pow(10, maximumCeilingDB / 20))
+        let ceiling = min(profile.peak, pow(10, maximumCeilingDB / 20))
         try Task.checkCancellation()
 
         // 3. Tone.
         progress(.tone)
-        let spectra: [[Double]] = [
-            MatchAnalysis.powerSpectrum(targetMid, profile: targetProfile),
-            MatchAnalysis.powerSpectrum(referenceMS!.mid, profile: referenceProfile),
-            MatchAnalysis.powerSpectrum(targetSide, profile: targetProfile),
-            MatchAnalysis.powerSpectrum(referenceMS!.side, profile: referenceProfile),
-        ]
-        referenceMS = nil
         let offsetDB = 20 * log10(max(firstGain, 1e-9))
-        let midCurve = MatchEQ.correction(target: spectra[0], reference: spectra[1], offsetDB: offsetDB)
-        let sideCurve = MatchEQ.correction(target: spectra[2], reference: spectra[3], offsetDB: offsetDB)
+        let midCurve = MatchEQ.correction(
+            targetDB: MatchEQ.smoothedDB(MatchAnalysis.powerSpectrum(targetMid, profile: targetProfile)),
+            referenceDB: profile.midDB, offsetDB: offsetDB)
+        let sideCurve = MatchEQ.correction(
+            targetDB: MatchEQ.smoothedDB(MatchAnalysis.powerSpectrum(targetSide, profile: targetProfile)),
+            referenceDB: profile.sideDB, offsetDB: offsetDB)
         try Task.checkCancellation()
 
         let count = target.frameCount
@@ -172,7 +181,7 @@ nonisolated enum Matcher {
         return MatchPreparation(unlimited: unlimited, gainDB: 20 * log10(max(gain, 1e-9)),
                                 autoCeilingDB: 20 * log10(max(ceiling, 1e-9)),
                                 midCurveDB: midCurve, sideCurveDB: sideCurve,
-                                defaultTargetLUFS: Loudness.integrated(Loudness.hops(reference)))
+                                defaultTargetLUFS: profile.stats.integrated)
     }
 
     /// Stages 1-4 with a saved curve instead of a reference: the tone

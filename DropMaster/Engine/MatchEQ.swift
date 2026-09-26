@@ -40,21 +40,20 @@ nonisolated enum MatchEQ {
 
     static var binHz: Double { StereoAudio.sampleRate / Double(firLength) }
 
-    /// Correction in dB per bin (`firLength / 2 + 1` bins), smoothed and
-    /// clamped. `offsetDB` is taken off before the clamp: the broadband
-    /// level difference is the level stage's job, and leaving it in would
-    /// let a quiet target spend the clamp's range on level instead of tone.
-    static func correction(target: [Double], reference: [Double], offsetDB: Double) -> [Double] {
-        let bins = target.count
-        precondition(reference.count == bins)
-        // A floor far below anything audible, relative to each spectrum's
-        // own maximum, so a digitally silent bin is a large ratio, not ±inf.
-        let targetFloor = (target.max() ?? 0) * 1e-12 + 1e-30
-        let referenceFloor = (reference.max() ?? 0) * 1e-12 + 1e-30
-        var raw = [Double](repeating: 0, count: bins)
-        for k in 0..<bins {
-            raw[k] = 10 * log10((reference[k] + referenceFloor) / (target[k] + targetFloor)) - offsetDB
-        }
+    /// One spectrum in dB, smoothed: the half of the correction that
+    /// belongs to one track. The smoothing is a weighted mean with the same
+    /// weights for every spectrum, so smoothing two spectra and subtracting
+    /// gives exactly the smoothed difference - which is what lets a
+    /// reference be measured once, kept (ReferenceProfile) and matched
+    /// against any target later.
+    ///
+    /// The floor sits far below anything audible, relative to the
+    /// spectrum's own maximum, so a digitally silent bin is a large
+    /// negative number, not -inf.
+    static func smoothedDB(_ spectrum: [Double]) -> [Double] {
+        let bins = spectrum.count
+        let floor = (spectrum.max() ?? 0) * 1e-12 + 1e-30
+        let raw = spectrum.map { 10 * log10($0 + floor) }
 
         let width = binHz
         let firstBin = Int((lowEdgeHz / width).rounded(.up))
@@ -78,7 +77,19 @@ nonisolated enum MatchEQ {
         }
         for k in 0..<firstBin { smoothed[k] = smoothed[firstBin] }
         for k in (lastBin + 1)..<bins { smoothed[k] = smoothed[lastBin] }
-        return smoothed.map { min(clampDB, max(-clampDB, $0)) }
+        return smoothed
+    }
+
+    /// Correction in dB per bin (`firLength / 2 + 1` bins), from two
+    /// `smoothedDB` spectra, clamped. `offsetDB` is taken off before the
+    /// clamp: the broadband level difference is the level stage's job, and
+    /// leaving it in would let a quiet target spend the clamp's range on
+    /// level instead of tone.
+    static func correction(targetDB: [Double], referenceDB: [Double], offsetDB: Double) -> [Double] {
+        precondition(referenceDB.count == targetDB.count)
+        return zip(referenceDB, targetDB).map { reference, target in
+            min(clampDB, max(-clampDB, reference - target - offsetDB))
+        }
     }
 
     /// A `firLength`-tap linear-phase FIR whose response is `curveDB`,
