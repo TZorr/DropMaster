@@ -2,8 +2,9 @@
 //  ContentView.swift
 //  DropMaster
 //
-//  One window, top to bottom in the order it is used: drop the two files,
-//  see what the match did, listen, export.
+//  One window, top to bottom in the order it is used: drop the target and
+//  a reference (up to five, one active - the numbers under the reference
+//  zone), see what the match did, listen, export.
 //
 
 import SwiftUI
@@ -13,15 +14,23 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 14) {
-            HStack(spacing: 16) {
-                ForEach(SlotRole.allCases) { role in
-                    DropZone(role: role, slot: model.slot(role),
-                             preset: role == .reference ? model.preset : nil,
-                             onDrop: { model.load($0, into: role) },
-                             onChoose: { model.choose(role) })
+            VStack(spacing: 6) {
+                HStack(spacing: 16) {
+                    ForEach(SlotRole.allCases) { role in
+                        DropZone(role: role, slot: model.slot(role),
+                                 preset: role == .reference ? model.preset : nil,
+                                 slotNumber: role == .reference ? model.activeReference + 1 : nil,
+                                 onDrop: { model.load($0, into: role) },
+                                 onChoose: { model.choose(role) })
+                    }
+                }
+                .frame(height: 150)
+
+                HStack {
+                    Spacer()
+                    ReferenceSlots(model: model)
                 }
             }
-            .frame(height: 150)
 
             // The one part that grows with the window: a taller curve is
             // easier to read; taller drop zones are just emptier.
@@ -35,7 +44,7 @@ struct ContentView: View {
 
             HStack(alignment: .top, spacing: 14) {
                 LoudnessTable(rows: [
-                    .init(name: "Target", present: model.target.audio != nil, stats: model.stats[.target]),
+                    .init(name: "Target", present: model.target.audio != nil, stats: model.stats(.target)),
                     .init(name: "Reference", present: model.reference.audio != nil || model.preset != nil,
                           stats: model.referenceStats),
                     .init(name: "Matched", present: model.result != nil, stats: model.matchedStats, emphasised: true),

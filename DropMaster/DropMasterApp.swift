@@ -12,9 +12,10 @@
 //  fractional-octave smoothing, a look-ahead limiter); no code or text was
 //  taken from Matchering, which is GPL. See README.md.
 //
-//  One window, one pair of files. The commands below mirror the window's
-//  controls, so everything can be done from the keyboard too; Space is the
-//  play/pause key because it is in every other audio app.
+//  One window: a target and up to five references, one of them active.
+//  The commands below mirror the window's controls, so everything can be
+//  done from the keyboard too; Space is the play/pause key because it is
+//  in every other audio app.
 //
 
 import SwiftUI
@@ -67,6 +68,17 @@ struct DropMasterApp: App {
                 Button("Reference") { model.player.play(.reference) }
                     .keyboardShortcut("3")
                     .disabled(model.target.audio == nil || model.reference.audio == nil)
+                Divider()
+                // ⌥⌘, not ⌘ (taken by the three above) and not ⌃, which
+                // Mission Control may own for switching desktops.
+                ForEach(0..<AppModel.referenceSlotCount, id: \.self) { index in
+                    Toggle("Reference Slot \(index + 1)", isOn: Binding(
+                        get: { model.activeReference == index },
+                        set: { if $0 { model.selectReference(index) } }))
+                        .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: [.command, .option])
+                }
+                Button("Clear Reference Slot") { model.clearReference(model.activeReference) }
+                    .disabled(model.reference.url == nil && model.preset == nil)
             }
         }
     }

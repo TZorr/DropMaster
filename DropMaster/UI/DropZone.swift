@@ -14,6 +14,8 @@
 //  The reference zone doubles as the preset's seat: with a preset loaded
 //  there is no reference file, and what the zone shows is the preset's
 //  name, the reference it was made from and that reference's loudness.
+//  It shows the active one of the five reference slots, and says which in
+//  its title.
 //
 
 import SwiftUI
@@ -23,6 +25,8 @@ struct DropZone: View {
     let slot: Slot
     /// Only the reference zone: a preset standing in for a file.
     var preset: MatchPreset? = nil
+    /// Only the reference zone: which of the slots it shows, 1-based.
+    var slotNumber: Int? = nil
     let onDrop: (URL) -> Void
     let onChoose: () -> Void
 
@@ -54,7 +58,7 @@ struct DropZone: View {
     @ViewBuilder
     private var content: some View {
         VStack(spacing: 8) {
-            Text(role.title.uppercased())
+            Text(slotNumber.map { "\(role.title.uppercased()) · \($0)" } ?? role.title.uppercased())
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .tracking(1.2)

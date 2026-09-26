@@ -2,21 +2,33 @@
 //  AppModel.swift
 //  DropMaster
 //
-//  The whole app state: two slots, one result, one player.
+//  The whole app state: a target, five reference slots, one result, one
+//  player.
 //
-//  A preset stands in for the reference: when one is loaded, the tone
-//  comes from its saved curve and the reference slot shows the preset
-//  instead. Dropping a reference again throws the preset away - two
-//  sources for the same curve would be one too many.
+//  Of the five references one is active, and the match, the Reference row
+//  and the Reference preview all mean that one. Choosing another slot
+//  matches again against it - half a second, not a decode: every slot
+//  keeps its decoded audio, about 110 MB for a five-minute song, so all
+//  five full is roughly half a gigabyte. That is the price of switching
+//  between references as fast as between Original and Matched. Nothing is
+//  remembered across launches, as with the target.
 //
-//  There is no "Match" button. The moment both slots hold decoded audio the
-//  match starts, and dropping a new file into either slot starts it again.
+//  A preset stands in for a reference: when one is loaded, the tone comes
+//  from its saved curve and its slot shows the preset instead. Dropping a
+//  reference into that slot throws the preset away - two sources for the
+//  same curve would be one too many. The preset's limiter settings are
+//  applied when it is opened, not every time its slot is chosen: a slot
+//  button that silently rewrote the limiter panel would be a trap.
+//
+//  There is no "Match" button. The moment the target and the active slot
+//  hold decoded audio the match starts, and dropping a new file into
+//  either starts it again. A reference decoding in another slot does not.
 //  Matching takes seconds, not minutes, and a button would only add a step
 //  between dropping a file and hearing what it does - the one thing the app
 //  is for.
 //
 //  Every background job carries a generation number - one per slot for
-//  decoding, one for matching. A file dropped while the previous one is
+//  decoding (the target and each reference slot), one for matching. A file dropped while the previous one is
 //  still decoding, or while a match is running, bumps them; results that
 //  come back with an older number are thrown away rather than overwriting
 //  newer ones. Per slot, not one for everything: dropping the reference
@@ -54,6 +66,13 @@ enum SlotRole: String, CaseIterable, Identifiable {
     }
 }
 
+/// Which slot a decode, its generation and its loudness figures belong
+/// to.
+enum SlotKey: Hashable {
+    case target
+    case reference(Int)
+}
+
 /// One drop zone's content.
 struct Slot {
     enum State {
@@ -80,20 +99,29 @@ enum MatchState {
 
 @Observable
 final class AppModel {
+    static let referenceSlotCount = 5
+
     private(set) var target = Slot()
-    private(set) var reference = Slot()
+    /// The reference slots; `activeReference` is the one matched against.
+    private(set) var references = Array(repeating: Slot(), count: AppModel.referenceSlotCount)
+    /// Saved matches standing in for a slot's reference, per slot.
+    private(set) var presets: [MatchPreset?] = Array(repeating: nil, count: AppModel.referenceSlotCount)
+    private(set) var activeReference = 0
     private(set) var match: MatchState = .idle
     private(set) var result: StereoAudio?
     /// The last export's outcome, shown beside the export buttons.
     private(set) var exportMessage: String?
     private(set) var exporting = false
     /// Loudness figures per slot, and of the result; nil while measuring.
-    private(set) var stats: [SlotRole: LoudnessStats] = [:]
+    private var slotStats: [SlotKey: LoudnessStats] = [:]
     private(set) var matchedStats: LoudnessStats?
     /// True while the limiter stage is running again for new settings.
     private(set) var refining = false
-    /// A saved match standing in for the reference, or nil.
-    private(set) var preset: MatchPreset?
+
+    /// The active slot's reference file, and the preset standing in for
+    /// it, or nil.
+    var reference: Slot { references[activeReference] }
+    var preset: MatchPreset? { presets[activeReference] }
 
     var limiter: LimiterSettings = AppModel.storedLimiter() {
         didSet {
@@ -107,9 +135,9 @@ final class AppModel {
 
     let player = ABPlayer()
 
-    @ObservationIgnored private var decodeGeneration: [SlotRole: Int] = [:]
+    @ObservationIgnored private var decodeGeneration: [SlotKey: Int] = [:]
     @ObservationIgnored private var matchGeneration = 0
-    @ObservationIgnored private var decodeTasks: [SlotRole: Task<Void, Never>] = [:]
+    @ObservationIgnored private var decodeTasks: [SlotKey: Task<Void, Never>] = [:]
     @ObservationIgnored private var matchTask: Task<Void, Never>?
     @ObservationIgnored private var preparation: MatchPreparation?
     @ObservationIgnored private var refineTask: Task<Void, Never>?
@@ -130,32 +158,56 @@ final class AppModel {
         role == .target ? target : reference
     }
 
+    /// The key a role means now: the reference is the active slot.
+    private func key(_ role: SlotRole) -> SlotKey {
+        role == .target ? .target : .reference(activeReference)
+    }
+
+    /// The target's figures, or the active reference file's.
+    func stats(_ role: SlotRole) -> LoudnessStats? { slotStats[key(role)] }
+
     // MARK: - Loading
 
     /// What the loudness table's Reference row shows: the loaded
     /// reference, or the figures the preset carries.
-    var referenceStats: LoudnessStats? { preset?.reference ?? stats[.reference] }
+    var referenceStats: LoudnessStats? { preset?.reference ?? stats(.reference) }
 
     /// Matching needs a target plus either a reference or a preset.
     var canMatch: Bool { target.audio != nil && (preset != nil || reference.audio != nil) }
 
     func load(_ url: URL, into role: SlotRole) {
-        let mine = (decodeGeneration[role] ?? 0) + 1
-        decodeGeneration[role] = mine
-        decodeTasks[role]?.cancel()
-        cancelMatch()
-        set(role, Slot(url: url, state: .decoding))
-        stats[role] = nil
-        if role == .target {
+        load(url, key: key(role))
+    }
+
+    /// A file dropped on a slot button: it goes into that slot, which
+    /// becomes the active one.
+    func loadReference(_ url: URL, slot index: Int) {
+        selectReference(index)
+        load(url, key: .reference(index))
+    }
+
+    private func load(_ url: URL, key: SlotKey) {
+        let mine = (decodeGeneration[key] ?? 0) + 1
+        decodeGeneration[key] = mine
+        decodeTasks[key]?.cancel()
+        set(key, Slot(url: url, state: .decoding))
+        slotStats[key] = nil
+        switch key {
+        case .target:
+            cancelMatch()
             player.setOriginal(nil)
             exportMessage = nil
-        } else {
-            player.setReference(nil)
-            // A dropped reference replaces a preset: it is the fresher
-            // answer to the same question.
-            preset = nil
+        case .reference(let index):
+            // A dropped reference replaces the slot's preset: it is the
+            // fresher answer to the same question.
+            presets[index] = nil
+            if index == activeReference {
+                cancelMatch()
+                player.setReference(nil)
+            }
         }
-        decodeTasks[role] = Task.detached(priority: .userInitiated) { [weak self] in
+        let role = key == .target ? SlotRole.target : .reference
+        decodeTasks[key] = Task.detached(priority: .userInitiated) { [weak self] in
             let state: Slot.State
             do {
                 let (audio, info) = try Decoder.decode(url)
@@ -166,39 +218,84 @@ final class AppModel {
             } catch {
                 state = .failed(error.localizedDescription)
             }
-            await self?.decoded(role, generation: mine, slot: Slot(url: url, state: state))
+            await self?.decoded(key, generation: mine, slot: Slot(url: url, state: state))
             if case .ready(let audio, _) = state {
                 let measured = LoudnessStats.measure(audio)
-                await self?.measured(role, generation: mine, stats: measured)
+                await self?.measured(key, generation: mine, stats: measured)
             }
         }
     }
 
-    private func measured(_ role: SlotRole, generation: Int, stats: LoudnessStats) {
-        guard decodeGeneration[role] == generation else { return }
-        self.stats[role] = stats
+    private func measured(_ key: SlotKey, generation: Int, stats: LoudnessStats) {
+        guard decodeGeneration[key] == generation else { return }
+        slotStats[key] = stats
     }
 
-    private func decoded(_ role: SlotRole, generation: Int, slot: Slot) {
-        guard decodeGeneration[role] == generation else { return }
-        set(role, slot)
-        if role == .target { player.setOriginal(target.audio) } else { player.setReference(reference.audio) }
+    private func decoded(_ key: SlotKey, generation: Int, slot: Slot) {
+        guard decodeGeneration[key] == generation else { return }
+        set(key, slot)
+        switch key {
+        case .target:
+            player.setOriginal(target.audio)
+        case .reference(let index):
+            // A slot in the background only fills; it is matched against
+            // when it is chosen.
+            guard index == activeReference else { return }
+            player.setReference(reference.audio)
+        }
         startMatchIfReady()
     }
 
+    /// Makes another slot the active reference and matches against it. An
+    /// empty slot leaves the match idle.
+    func selectReference(_ index: Int) {
+        guard references.indices.contains(index), index != activeReference else { return }
+        activeReference = index
+        player.setReference(reference.audio)
+        cancelMatch()
+        startMatchIfReady()
+    }
+
+    /// Empties a slot: its file, its preset and its figures.
+    func clearReference(_ index: Int) {
+        guard references.indices.contains(index) else { return }
+        let key = SlotKey.reference(index)
+        decodeTasks[key]?.cancel()
+        decodeGeneration[key] = (decodeGeneration[key] ?? 0) + 1
+        references[index] = Slot()
+        presets[index] = nil
+        slotStats[key] = nil
+        if index == activeReference {
+            player.setReference(nil)
+            cancelMatch()
+        }
+    }
+
+    func chooseReference(slot index: Int) {
+        guard let url = openAudioPanel(title: "Choose reference \(index + 1)") else { return }
+        loadReference(url, slot: index)
+    }
+
     func choose(_ role: SlotRole) {
-        let panel = NSOpenPanel()
-        panel.title = "Choose the \(role.title.lowercased())"
-        panel.allowedContentTypes = [.audio]
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        if panel.runModal() == .OK, let url = panel.url {
+        if let url = openAudioPanel(title: "Choose the \(role.title.lowercased())") {
             load(url, into: role)
         }
     }
 
-    private func set(_ role: SlotRole, _ slot: Slot) {
-        if role == .target { target = slot } else { reference = slot }
+    private func openAudioPanel(title: String) -> URL? {
+        let panel = NSOpenPanel()
+        panel.title = title
+        panel.allowedContentTypes = [.audio]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+
+    private func set(_ key: SlotKey, _ slot: Slot) {
+        switch key {
+        case .target: target = slot
+        case .reference(let index): references[index] = slot
+        }
     }
 
     // MARK: - Matching
@@ -311,15 +408,16 @@ final class AppModel {
 
     // MARK: - Presets
 
-    /// A built-in preset, or one already read from a file.
+    /// A preset read from a file, into the active slot.
     func apply(_ loaded: MatchPreset) {
-        preset = loaded
+        let index = activeReference, key = SlotKey.reference(activeReference)
+        presets[index] = loaded
         limiter = loaded.limiter
-        // The preset answers for the reference; its slot shows it.
-        decodeTasks[.reference]?.cancel()
-        decodeGeneration[.reference] = (decodeGeneration[.reference] ?? 0) + 1
-        reference = Slot()
-        stats[.reference] = nil
+        // The preset answers for the slot's reference; the slot shows it.
+        decodeTasks[key]?.cancel()
+        decodeGeneration[key] = (decodeGeneration[key] ?? 0) + 1
+        references[index] = Slot()
+        slotStats[key] = nil
         player.setReference(nil)
         cancelMatch()
         startMatchIfReady()
@@ -356,7 +454,7 @@ final class AppModel {
         do {
             try saved.write(to: url)
             exportMessage = "Saved \(url.lastPathComponent)"
-            if preset != nil { preset = saved }
+            if preset != nil { presets[activeReference] = saved }
         } catch {
             exportMessage = error.localizedDescription
         }
@@ -364,7 +462,7 @@ final class AppModel {
 
     func closePreset() {
         guard preset != nil else { return }
-        preset = nil
+        presets[activeReference] = nil
         cancelMatch()
         startMatchIfReady()
     }

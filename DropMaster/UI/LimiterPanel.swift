@@ -182,7 +182,7 @@ struct LimiterPanel: View {
 struct TargetStepper: View {
     @Bindable var model: AppModel
 
-    private var shown: Double? { model.limiter.targetLUFS ?? model.stats[.reference]?.integrated }
+    private var shown: Double? { model.limiter.targetLUFS ?? model.referenceStats?.integrated }
 
     var body: some View {
         HStack(spacing: 4) {

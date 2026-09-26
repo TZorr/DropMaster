@@ -35,6 +35,14 @@ to the files you pick.
 1. Drop a target and a reference onto the two zones (or click a zone to
    choose a file). WAV, AIFF, CAF, FLAC, ALAC, AAC/M4A and MP3 all work;
    anything not at 44.1 kHz is resampled, mono is played on both sides.
+
+   The reference has five slots: the buttons **1 2 3 4 5** under its zone.
+   The zone always shows the active slot, and choosing another one (click,
+   or ⌥⌘1 … ⌥⌘5) matches the target against that reference again. That
+   takes about half a second, because each slot keeps its decoded audio
+   (about 110 MB for a five-minute song). A file dropped on a number goes
+   straight into that slot and makes it active. Right-click a number to
+   choose a file or clear the slot. Slots are not kept after the app quits.
 2. Matching starts on its own and takes about a second. The curves show the
    tone correction for Mid (solid) and Side (dashed); beside them, the
    overall gain, the ceiling and the deepest limiter reduction.
@@ -108,10 +116,12 @@ Target and reference may each be 3 seconds to 20 minutes long.
 
 **File › Save Preset…** (⌘S) keeps the current match: the tone correction,
 the reference's loudness figures, the ceiling it asked for and the limiter
-settings. **Open Preset…** (⌘P) puts it back - it then stands in the
-reference's place, so a whole album can be matched to one record without
-loading that record again. **Close Preset** returns to the dropped
-reference; dropping a reference does the same.
+settings. **Open Preset…** (⌘P) puts it back into the active reference
+slot, where it stands in for the reference, so a whole album can be
+matched to one record without loading that record again. Its limiter
+settings are applied when it is opened, not every time its slot is chosen.
+**Close Preset** empties that slot again; dropping a reference into it
+replaces the preset.
 
 The curve is stored 24 points per octave from 20 Hz to 20 kHz, 240 numbers
 per channel rather than the 2049 FFT bins it is computed on. Rebuilding the
